@@ -31,7 +31,8 @@ const CFG = {
   thinking: (process.env.LLM_THINKING || fileCfg.thinking || 'max').toLowerCase(),
   authPath: process.env.OPENCODE_AUTH || path.join(process.env.HOME || '/root', '.local/share/opencode/auth.json'),
   apiKey: fileCfg.apiKey || '',
-  replyCooldownMs: 500
+  replyCooldownMs: 500,
+  allowTp: fileCfg.allowTp !== false
 };
 CFG.apiBase = CFG.apiBase || PROVIDERS[CFG.provider] || PROVIDERS.deepseek;
 
@@ -43,6 +44,7 @@ const SYSTEM_PROMPT = [
   '动作：follow=跟着玩家；come=走到玩家身边；stop=停下；build_house=在玩家附近盖一栋小木屋；dance=跳舞；look=看向玩家；wander=随便走走；none=不动。',
   '玩家让你建房子/盖房子时，必须选择 build_house。玩家让你跟着/过来/停下时选对应动作。',
   '你可以主动说话：如果话题自然，就主动搭话；没必要时可以 say 为空。',
+  '重要：如果你说你要过来、下来、跟着、停下或建房子，action 必须是对应动作，绝对不能 action=none。不能说一套做一套。',
   '不要每句话都提自己是 AI。像真人一样聊天。'
 ].join('\n');
 
@@ -83,6 +85,10 @@ let building = false;
 let hasOp = null;
 let lastSpeaker = null;
 let joinedAt = 0;
+let lastHouse = null;
+try { lastHouse = JSON.parse(fs.readFileSync(path.join(__dirname, 'lastHouse.json'), 'utf8')); } catch {}
+let goalSince = 0;
+function saveHouse () { try { fs.writeFileSync(path.join(__dirname, 'lastHouse.json'), JSON.stringify(lastHouse)); } catch {} }
 
 function log (...a) { console.log(new Date().toISOString().slice(11, 19), ...a); }
 
@@ -197,20 +203,17 @@ function say (text) {
   if (history.length > 40) history.splice(0, history.length - 40);
 }
 
-function doAction (action) {
-  const target = nearestPlayerEntity();
+function doAction (action, targetName) {
+  const target = (targetName && bot.players[targetName] && bot.players[targetName].entity) || nearestPlayerEntity();
   if (!target && action !== 'stop' && action !== 'wander') return;
   try {
     if (action === 'follow') {
       currentTarget = target;
+      goalSince = Date.now();
       bot.pathfinder.setGoal(new GoalFollow(target, 2), true);
       log('action follow', playerNameOf(target));
     } else if (action === 'come') {
-      currentTarget = target;
-      const p = target.position;
-      const ground = findGround(p.x, p.y, p.z);
-      bot.pathfinder.setGoal(new GoalNear(p.x, ground, p.z, 2), true);
-      log('action come');
+      comeTo(target, targetName);
     } else if (action === 'stop') {
       currentTarget = null;
       bot.pathfinder.setGoal(null);
@@ -226,7 +229,10 @@ function doAction (action) {
       wander();
     } else if (action === 'build_house') {
       pendingBuild = false;
-      buildHouse();
+      buildHouse(false);
+    } else if (action === 'build_villa') {
+      pendingBuild = false;
+      buildHouse(true);
     }
     lastActionAt = Date.now();
   } catch (e) {
@@ -237,6 +243,42 @@ function doAction (action) {
 function jump () {
   bot.setControlState('jump', true);
   setTimeout(() => bot.setControlState('jump', false), 300);
+}
+
+function comeTo (target, nameOverride) {
+  const name = nameOverride || playerNameOf(target);
+  if (!target && !name) return;
+  currentTarget = target || null;
+  goalSince = Date.now();
+  if (CFG.allowTp && name) {
+    cmd(`/tp ${bot.username} ${name}`);
+    log('tp to', name);
+    if (target) setTimeout(() => { try { bot.lookAt(target.position.offset(0, 1.6, 0), true); } catch {} }, 500);
+    return;
+  }
+  if (!target) return;
+  const p = target.position;
+  const ground = findGround(p.x, p.y, p.z);
+  bot.pathfinder.setGoal(new GoalNear(p.x, ground, p.z, 2), true);
+  log('action come');
+  const started = Date.now();
+  const timer = setInterval(() => {
+    if (!bot.entity || currentTarget !== target) { clearInterval(timer); return; }
+    const dist = bot.entity.position.distanceTo(target.position);
+    if (dist <= 3) { clearInterval(timer); return; }
+    if (Date.now() - started > 7000) {
+      clearInterval(timer);
+      if (dist > 6 && CFG.allowTp && name) { cmd(`/tp ${bot.username} ${name}`); log('tp fallback to', name); }
+    }
+  }, 1000);
+}
+
+function inferAction (say, action) {
+  if (action && action !== 'none') return action;
+  if (/下来|下去|过来|来了|到你旁边|马上到|这就来|蹦下来|找你/.test(say)) return 'come';
+  if (/跟着|跟紧|陪你走|跟你走/.test(say)) return 'follow';
+  if (/停下|别动|站住|不走/.test(say)) return 'stop';
+  return action;
 }
 
 let dancing = false;
@@ -275,7 +317,7 @@ function cmd (c) { try { bot.chat(c); } catch {} }
 
 function chatAsync (text) { say(text); }
 
-async function buildHouse () {
+async function buildHouse (villa) {
   if (building) return;
   building = true;
   pendingBuild = false;
@@ -298,8 +340,9 @@ async function buildHouse () {
   const groundY = findGround(baseX, player.position.y, baseZ);
   const floorY = groundY - 1;
 
-  const x0 = baseX - 3, x1 = baseX + 3;
-  const z0 = baseZ - 3, z1 = baseZ + 3;
+  const r = villa ? 4 : 3;
+  const x0 = baseX - r, x1 = baseX + r;
+  const z0 = baseZ - r, z1 = baseZ + r;
   const y0 = floorY;
   const y1 = floorY + 1;
   const y2 = floorY + 2;
@@ -307,7 +350,7 @@ async function buildHouse () {
   const y4 = floorY + 4;
   const y5 = floorY + 5;
 
-  say(`${pname}，收到！我在这边给你盖个小木屋，别嫌丑哈。`);
+  say(villa ? `${pname}，别墅是吧？行，先给你起个两层小楼！` : `${pname}，收到！我在这边给你盖个小木屋，别嫌丑哈。`);
 
   // 用地板探测权限
   cmd(`/fill ${x0} ${y0} ${z0} ${x1} ${y0} ${z1} minecraft:oak_planks`);
@@ -330,44 +373,108 @@ async function buildHouse () {
   say('地基打好了，开始垒墙！');
   await sleep(250);
 
-  // 地板已经填好；墙体
-  cmd(`/fill ${x1} ${y1} ${z0} ${x1} ${y3} ${z1} minecraft:oak_planks`);
-  await sleep(220);
-  cmd(`/fill ${x0} ${y1} ${z0} ${x0} ${y3} ${z1} minecraft:oak_planks`);
-  await sleep(220);
-  cmd(`/fill ${x0} ${y1} ${z1} ${x1} ${y3} ${z1} minecraft:oak_planks`);
-  await sleep(220);
-  cmd(`/fill ${x0} ${y1} ${z0} ${x1} ${y3} ${z0} minecraft:oak_planks`);
-  await sleep(300);
-
-  // 窗户
-  cmd(`/fill ${x0 + 1} ${y2} ${z1} ${x0 + 2} ${y2} ${z1} minecraft:glass`);
-  await sleep(180);
-  cmd(`/fill ${x1 - 2} ${y2} ${z1} ${x1 - 1} ${y2} ${z1} minecraft:glass`);
-  await sleep(180);
-  cmd(`/fill ${x0} ${y2} ${z0 + 2} ${x0} ${y2} ${z0 + 4} minecraft:glass`);
-  await sleep(180);
-  cmd(`/fill ${x1} ${y2} ${z0 + 2} ${x1} ${y2} ${z0 + 4} minecraft:glass`);
-  await sleep(250);
-
-  // 门洞
-  cmd(`/fill ${x0 + 3} ${y1} ${z0} ${x0 + 3} ${y2} ${z0} minecraft:air`);
-  await sleep(220);
-
-  // 屋顶
-  cmd(`/fill ${x0} ${y4} ${z0} ${x1} ${y4} ${z1} minecraft:spruce_planks`);
-  await sleep(250);
-  cmd(`/fill ${x0 + 1} ${y5} ${z0 + 1} ${x1 - 1} ${y5} ${z1 - 1} minecraft:spruce_planks`);
-  await sleep(250);
-
-  // 室内灯
-  cmd(`/setblock ${x0 + 3} ${y1} ${z0 + 3} minecraft:lantern`);
+  if (!villa) {
+    cmd(`/fill ${x1} ${y1} ${z0} ${x1} ${y3} ${z1} minecraft:oak_planks`);
+    await sleep(220);
+    cmd(`/fill ${x0} ${y1} ${z0} ${x0} ${y3} ${z1} minecraft:oak_planks`);
+    await sleep(220);
+    cmd(`/fill ${x0} ${y1} ${z1} ${x1} ${y3} ${z1} minecraft:oak_planks`);
+    await sleep(220);
+    cmd(`/fill ${x0} ${y1} ${z0} ${x1} ${y3} ${z0} minecraft:oak_planks`);
+    await sleep(300);
+    cmd(`/fill ${x0 + 1} ${y2} ${z1} ${x0 + 2} ${y2} ${z1} minecraft:glass`);
+    await sleep(160);
+    cmd(`/fill ${x1 - 2} ${y2} ${z1} ${x1 - 1} ${y2} ${z1} minecraft:glass`);
+    await sleep(160);
+    cmd(`/fill ${x0} ${y2} ${z0 + 2} ${x0} ${y2} ${z0 + 4} minecraft:glass`);
+    await sleep(160);
+    cmd(`/fill ${x1} ${y2} ${z0 + 2} ${x1} ${y2} ${z0 + 4} minecraft:glass`);
+    await sleep(200);
+    cmd(`/fill ${x0 + 3} ${y1} ${z0} ${x0 + 3} ${y2} ${z0} minecraft:air`);
+    await sleep(180);
+    cmd(`/fill ${x0} ${y4} ${z0} ${x1} ${y4} ${z1} minecraft:spruce_planks`);
+    await sleep(220);
+    cmd(`/fill ${x0 + 1} ${y5} ${z0 + 1} ${x1 - 1} ${y5} ${z1 - 1} minecraft:spruce_planks`);
+    await sleep(220);
+    cmd(`/setblock ${x0 + 3} ${y1} ${z0 + 3} minecraft:lantern`);
+    lastHouse = { x0, x1, z0, z1, y0, doorX: x0 + 3, doorZ: z0, r: 3 };
+    saveHouse();
+  } else {
+    const y6 = floorY + 6, y7 = floorY + 7, y8 = floorY + 8;
+    // 一楼墙
+    cmd(`/fill ${x1} ${y1} ${z0} ${x1} ${y3} ${z1} minecraft:stone_bricks`);
+    await sleep(180);
+    cmd(`/fill ${x0} ${y1} ${z0} ${x0} ${y3} ${z1} minecraft:stone_bricks`);
+    await sleep(180);
+    cmd(`/fill ${x0} ${y1} ${z1} ${x1} ${y3} ${z1} minecraft:oak_planks`);
+    await sleep(180);
+    cmd(`/fill ${x0} ${y1} ${z0} ${x1} ${y3} ${z0} minecraft:oak_planks`);
+    await sleep(220);
+    // 一楼窗和门
+    cmd(`/fill ${x0} ${y2} ${z0 + 2} ${x0} ${y2} ${z0 + 6} minecraft:glass`);
+    await sleep(160);
+    cmd(`/fill ${x1} ${y2} ${z0 + 2} ${x1} ${y2} ${z0 + 6} minecraft:glass`);
+    await sleep(160);
+    cmd(`/fill ${x0 + 4} ${y1} ${z0} ${x0 + 4} ${y2} ${z0} minecraft:air`);
+    await sleep(180);
+    // 二楼地板
+    cmd(`/fill ${x0} ${y4} ${z0} ${x1} ${y4} ${z1} minecraft:oak_planks`);
+    await sleep(220);
+    // 二楼墙
+    cmd(`/fill ${x1} ${y4 + 1} ${z0} ${x1} ${y6} ${z1} minecraft:white_terracotta`);
+    await sleep(180);
+    cmd(`/fill ${x0} ${y4 + 1} ${z0} ${x0} ${y6} ${z1} minecraft:white_terracotta`);
+    await sleep(180);
+    cmd(`/fill ${x0} ${y4 + 1} ${z1} ${x1} ${y6} ${z1} minecraft:oak_planks`);
+    await sleep(180);
+    cmd(`/fill ${x0} ${y4 + 1} ${z0} ${x1} ${y6} ${z0} minecraft:oak_planks`);
+    await sleep(220);
+    // 二楼窗
+    cmd(`/fill ${x0} ${y5} ${z0 + 2} ${x0} ${y5} ${z0 + 6} minecraft:glass`);
+    await sleep(160);
+    cmd(`/fill ${x1} ${y5} ${z0 + 2} ${x1} ${y5} ${z0 + 6} minecraft:glass`);
+    await sleep(160);
+    // 屋顶三层
+    cmd(`/fill ${x0} ${y7} ${z0} ${x1} ${y7} ${z1} minecraft:spruce_planks`);
+    await sleep(220);
+    cmd(`/fill ${x0 + 1} ${y8} ${z0 + 1} ${x1 - 1} ${y8} ${z1 - 1} minecraft:spruce_planks`);
+    await sleep(220);
+    cmd(`/fill ${x0 + 2} ${y8 + 1} ${z0 + 2} ${x1 - 2} ${y8 + 1} ${z1 - 2} minecraft:spruce_planks`);
+    await sleep(220);
+    cmd(`/setblock ${x0 + 4} ${y1} ${z0 + 4} minecraft:lantern`);
+    await sleep(160);
+    cmd(`/setblock ${x0 + 4} ${y5} ${z0 + 4} minecraft:lantern`);
+    lastHouse = { x0, x1, z0, z1, y0, doorX: x0 + 4, doorZ: z0, r: 4 };
+    saveHouse();
+  }
   await sleep(200);
 
   building = false;
-  say('完工！虽然不大，但遮风挡雨够了。走，进去看看？');
+  say(villa ? '别墅封顶！虽然算不上宫殿，但绝对能住人。走，进去看看？' : '完工！虽然不大，但遮风挡雨够了。走，进去看看？');
   currentTarget = player;
   try { bot.pathfinder.setGoal(new GoalFollow(player, 2), true); } catch {}
+}
+
+async function decorateHouse (username) {
+  if (!lastHouse) { say('还没房子呢，先让我建一个吧。'); return; }
+  const { x0, x1, z0, z1, y0, doorX, doorZ } = lastHouse;
+  const y = y0 + 1;
+  say('行，我给它加一圈栅栏和灯，再铺条小路。');
+  cmd(`/fill ${x0 - 1} ${y} ${z0 - 1} ${x1 + 1} ${y} ${z0 - 1} minecraft:oak_fence`);
+  await sleep(180);
+  cmd(`/fill ${x0 - 1} ${y} ${z1 + 1} ${x1 + 1} ${y} ${z1 + 1} minecraft:oak_fence`);
+  await sleep(180);
+  cmd(`/fill ${x0 - 1} ${y} ${z0 - 1} ${x0 - 1} ${y} ${z1 + 1} minecraft:oak_fence`);
+  await sleep(180);
+  cmd(`/fill ${x1 + 1} ${y} ${z0 - 1} ${x1 + 1} ${y} ${z1 + 1} minecraft:oak_fence`);
+  await sleep(180);
+  cmd(`/setblock ${x0 - 1} ${y + 1} ${z0 - 1} minecraft:lantern`);
+  await sleep(120);
+  cmd(`/setblock ${x1 + 1} ${y + 1} ${z0 - 1} minecraft:lantern`);
+  await sleep(120);
+  cmd(`/fill ${doorX} ${y0} ${doorZ - 1} ${doorX} ${y0} ${doorZ - 6} minecraft:stone_bricks`);
+  await sleep(200);
+  say('装修完了，怎么样，有点样子了吧？');
 }
 
 let lastHurtAt = 0;
@@ -467,6 +574,17 @@ function connect () {
   });
 
   startProactiveLoop();
+  setInterval(() => {
+    if (!currentTarget || !bot.entity) return;
+    const name = playerNameOf(currentTarget);
+    if (!name) return;
+    const d = bot.entity.position.distanceTo(currentTarget.position);
+    if (d > 24 && CFG.allowTp && Date.now() - goalSince > 8000) {
+      cmd(`/tp ${bot.username} ${name}`);
+      log('follow tp to', name);
+      goalSince = Date.now();
+    }
+  }, 5000);
 }
 
 async function handleChat (username, message) {
@@ -474,11 +592,19 @@ async function handleChat (username, message) {
   if (!text || text.startsWith('/')) return;
 
   // 直接指令优先，避免 LLM 抽风
-  if (/建(个|一个|一栋)?房|盖(个|一个|一栋)?房|造(个|一个)?房|建(个)?小屋|盖(个)?小屋/.test(text)) {
-    doAction('build_house');
+  if (/别墅|大房子|两层|二层/.test(text) && /建|盖|造/.test(text)) {
+    doAction('build_villa', username);
     return;
-  } else if (/跟着我|跟我来|过来|来这里|跟我走/.test(text)) {
-    doAction('follow');
+  } else if (/建(个|一个|一栋)?房|盖(个|一个|一栋)?房|造(个|一个)?房|建(个)?小屋|盖(个)?小屋|盖房子|建房子/.test(text)) {
+    doAction('build_house', username);
+    return;
+  } else if (/优化|装修|好看|装饰|改改/.test(text) && /房/.test(text)) {
+    decorateHouse(username);
+    return;
+  } else if (/下来|下去|过来|出来|咋不出来|到我(这里|旁边)|站我(旁边|这里)|来我(这里|旁边)|到你旁边/.test(text)) {
+    doAction('come', username);
+  } else if (/跟着我|跟紧我|跟我来|跟我走|跟着/.test(text)) {
+    doAction('follow', username);
   } else if (/停下|别动|站住|不要动/.test(text)) {
     doAction('stop');
   } else if (/跳(个)?舞|跳舞/.test(text)) {
@@ -504,9 +630,10 @@ async function queueLLM (username, text, proactive) {
   busy = true;
   try {
     const content = await askLLM(username, text, proactive);
-    const { say: reply, action } = parseReply(content);
+    let { say: reply, action } = parseReply(content);
+    action = inferAction(reply, action);
     if (reply) { say(reply); lastChatAt = Date.now(); }
-    if (action && action !== 'none') doAction(action);
+    if (action && action !== 'none') doAction(action, lastSpeaker || username);
   } catch (e) {
     log('LLM error:', e.message);
   } finally {
