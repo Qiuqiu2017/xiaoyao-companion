@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "fixlan",
+  "version": "1.0.0",
+  "name": "Fix LAN Offline Auth",
+  "description": "Disables online-mode on the integrated server so offline players can join LAN worlds.",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.local.fixlan.FixLanAuth"]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "minecraft": "1.21.11",
+    "fabric-api": "*"
+  }
+}
