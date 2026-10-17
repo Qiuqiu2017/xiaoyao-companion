@@ -1,0 +1,18 @@
+{
+  "name": "xiaoyao-companion",
+  "version": "1.0.0",
+  "description": "AI companion bot for Minecraft Fabric 1.21.11 (offline account xiaoyao)",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "mineflayer": "^4.39.0",
+    "mineflayer-pathfinder": "^2.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
