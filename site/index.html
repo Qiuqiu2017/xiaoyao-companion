@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小遥 · Minecraft AI 陪玩</title>
+<meta name="description" content="小遥是 Minecraft Fabric 1.21.11 的 AI 陪玩机器人，支持自选提供商、模型、思考强度与 API Key。">
+<style>
+  :root{
+    --bg:#0f1115; --surface:#171a21; --surface2:#1e2230; --border:#2a2f3a;
+    --text:#e8eaf0; --dim:#9aa2b1; --accent:#3ddc84;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:Inter,"Noto Sans CJK SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    line-height:1.65;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:960px;margin:0 auto;padding:0 24px}
+  header{padding:26px 0;display:flex;align-items:center;justify-content:space-between}
+  .brand{display:flex;align-items:center;gap:12px;font-weight:800;font-size:20px}
+  .brand img{width:36px;height:36px;border-radius:10px}
+  .nav a{color:var(--dim);margin-left:20px;font-weight:600}
+  .hero{padding:56px 0 40px}
+  .hero h1{font-size:44px;line-height:1.15;margin:0 0 16px;font-weight:800}
+  .hero p{font-size:18px;color:var(--dim);max-width:660px;margin:0 0 28px}
+  .btns{display:flex;gap:14px;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:13px 22px;border-radius:12px;
+    font-weight:700;border:1px solid var(--border);background:var(--surface);color:var(--text)}
+  .btn.primary{background:var(--accent);color:#06210f;border:none}
+  .btn:hover{text-decoration:none;filter:brightness(1.06)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;padding:8px 0 56px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px}
+  .card h3{margin:0 0 8px;font-size:16px}
+  .card p{margin:0;color:var(--dim);font-size:14px}
+  section{padding:40px 0;border-top:1px solid var(--border)}
+  h2{font-size:24px;margin:0 0 20px}
+  .ver{background:var(--surface);border:1px solid var(--border);border-radius:14px;
+    padding:18px;margin-bottom:14px}
+  .ver .top{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  .ver .tag{font-weight:800;font-size:18px}
+  .ver .date{color:var(--dim);font-size:13px}
+  .badge{background:rgba(61,220,132,.15);color:var(--accent);border-radius:8px;
+    padding:2px 10px;font-size:12px;font-weight:700}
+  .ver .notes{color:var(--dim);font-size:14px;white-space:pre-wrap;margin:8px 0 12px}
+  .ver .dl{display:flex;gap:10px;flex-wrap:wrap}
+  .ver .dl a{font-size:14px}
+  footer{padding:40px 0;color:var(--dim);font-size:13px;border-top:1px solid var(--border)}
+  code{background:var(--surface2);padding:2px 6px;border-radius:6px;font-size:13px}
+  pre{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px;overflow:auto;font-size:13px}
+  .warn{color:#ffb020;font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand"><img src="icon.svg" alt="">小遥</div>
+    <nav class="nav">
+      <a href="#download">下载</a>
+      <a href="#setup">使用</a>
+      <a href="https://github.com/Qiuqiu2017/xiaoyao-companion" target="_blank" rel="noopener">GitHub</a>
+      <a href="/">导航</a>
+    </nav>
+  </header>
+
+  <div class="hero">
+    <h1>会陪你玩 Minecraft 的 AI</h1>
+    <p>小遥是一个 Fabric 1.21.11 的 AI 陪玩机器人，以离线账号 <code>xiaoyao</code> 登录你的局域网世界，
+       跟你聊天、跟着你走。Fabric 模组内置设置界面，可自选提供商、模型、思考强度和 API Key。</p>
+    <div class="btns">
+      <a class="btn primary" href="#download">下载最新版</a>
+      <a class="btn" href="https://github.com/Qiuqiu2017/xiaoyao-companion" target="_blank" rel="noopener">查看源码</a>
+    </div>
+  </div>
+
+  <div class="cards">
+    <div class="card"><h3>自选提供商</h3><p>DeepSeek、OpenAI、OpenRouter、SiliconFlow，或自定义 OpenAI 兼容接口。</p></div>
+    <div class="card"><h3>模型与思考强度</h3><p>模型 ID 自由填写，思考强度可选 Off / Low / Medium / High / Max。</p></div>
+    <div class="card"><h3>Fabric 模组设置</h3><p>Meteor Client 的 Misc 分类里直接配置并一键启动/停止，无需改代码。</p></div>
+    <div class="card"><h3>真的会跟随</h3><p>基于路径寻路跟随你，遇到指令会停下、过来或看向你。</p></div>
+    <div class="card"><h3>离线账号</h3><p>以 xiaoyao 离线身份加入；附带 fixlan 模组解决 1.21.11 LAN 正版验证。</p></div>
+    <div class="card"><h3>独立进程</h3><p>机器人作为独立玩家登录，不干扰你正在玩的客户端。</p></div>
+  </div>
+
+  <section id="download">
+    <h2>下载</h2>
+    <div class="ver">
+      <div class="top">
+        <span class="tag">v1.0.0</span>
+        <span class="badge">最新</span>
+        <span class="date">2026-10-17</span>
+      </div>
+      <div class="notes">首个版本：Meteor 附加模组 + 陪玩内核 + 离线 LAN 修复模组。</div>
+      <div class="dl">
+        <a class="btn" href="https://github.com/Qiuqiu2017/xiaoyao-companion/releases/download/v1.0.0/xiaoyao-ai-1.0.0.jar">下载 Fabric 模组 (.jar)</a>
+        <a class="btn" href="https://github.com/Qiuqiu2017/xiaoyao-companion/releases/download/v1.0.0/fixlan-1.0.0.jar">下载 fixlan (.jar)</a>
+        <a class="btn" href="https://github.com/Qiuqiu2017/xiaoyao-companion">源码</a>
+      </div>
+    </div>
+    <p style="color:var(--dim)">需要 Minecraft 1.21.11 + Fabric、Meteor Client、Node.js 20+。</p>
+  </section>
+
+  <section id="setup">
+    <h2>使用</h2>
+    <p>1. 把 <code>xiaoyao-ai-1.0.0.jar</code> 放入 <code>mods</code>；进世界后「对局域网开放」。</p>
+    <p>2. 打开 Meteor ClickGUI → <code>Misc → Xiaoyao AI</code>，填好 provider、model、thinking、api-key。</p>
+    <p>3. 打开模块开关，小遥会自动加入并开始聊天、跟随。</p>
+    <p class="warn">API Key 会保存在本地配置里，请不要把配置文件发给别人。</p>
+  </section>
+
+  <section>
+    <h2>从源码运行内核</h2>
+    <pre>git clone https://github.com/Qiuqiu2017/xiaoyao-companion
+cd xiaoyao-companion
+npm install
+node bot.js</pre>
+    <p style="color:var(--dim)">也可以设置 <code>XIAOYAO_CONFIG</code> 指向自定义配置文件。</p>
+  </section>
+
+  <footer>
+    小遥是独立开源项目，遵循 MIT，与 Mojang、Microsoft、Meteor Client 无隶属关系。
+  </footer>
+</div>
+</body>
+</html>
