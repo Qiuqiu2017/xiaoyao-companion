@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.log
+config.json
+config.runtime.json
+bot.log
+dist/
+fabric-mod/out/
