@@ -1,0 +1,11 @@
+{
+  "provider": "deepseek",
+  "baseUrl": "",
+  "model": "deepseek-flash",
+  "thinking": "max",
+  "apiKey": "",
+  "host": "127.0.0.1",
+  "port": 0,
+  "logPath": "",
+  "username": "xiaoyao"
+}
