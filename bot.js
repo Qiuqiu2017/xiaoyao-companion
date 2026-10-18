@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const mineflayer = require('mineflayer');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { GoalFollow, GoalNear } = goals;
@@ -32,7 +33,7 @@ const CFG = {
   authPath: process.env.OPENCODE_AUTH || path.join(process.env.HOME || '/root', '.local/share/opencode/auth.json'),
   apiKey: fileCfg.apiKey || '',
   replyCooldownMs: 500,
-  allowTp: fileCfg.allowTp !== false
+  allowTp: fileCfg.allowTp === true
 };
 CFG.apiBase = CFG.apiBase || PROVIDERS[CFG.provider] || PROVIDERS.deepseek;
 
@@ -63,13 +64,23 @@ function loadKey () {
 
 function detectPort () {
   if (!CFG.logPath) return null;
+  const dir = path.dirname(CFG.logPath);
+  let files = [];
   try {
-    const txt = fs.readFileSync(CFG.logPath, 'utf8');
-    const m = [...txt.matchAll(/Started serving on (\d+)/g)];
-    return m.length ? parseInt(m[m.length - 1][1], 10) : null;
-  } catch {
-    return null;
+    files = fs.readdirSync(dir).filter(f => f.endsWith('.log') || f.endsWith('.log.gz'));
+  } catch { return null; }
+  files.sort((a, b) => {
+    try { return fs.statSync(path.join(dir, b)).mtimeMs - fs.statSync(path.join(dir, a)).mtimeMs; } catch { return 0; }
+  });
+  for (const f of files) {
+    try {
+      const raw = fs.readFileSync(path.join(dir, f));
+      const txt = f.endsWith('.gz') ? zlib.gunzipSync(raw).toString('utf8') : raw.toString('utf8');
+      const m = [...txt.matchAll(/Started serving on (\d+)/g)];
+      if (m.length) return parseInt(m[m.length - 1][1], 10);
+    } catch {}
   }
+  return null;
 }
 
 const history = [];
@@ -205,16 +216,16 @@ function say (text) {
 
 function doAction (action, targetName) {
   const target = (targetName && bot.players[targetName] && bot.players[targetName].entity) || nearestPlayerEntity();
-  if (!target && action !== 'stop' && action !== 'wander') return;
+  if (!target && !targetName && action !== 'stop' && action !== 'wander') return;
   try {
     if (action === 'follow') {
-      currentTarget = target;
-      goalSince = Date.now();
-      bot.pathfinder.setGoal(new GoalFollow(target, 2), true);
-      log('action follow', playerNameOf(target));
+      const name = targetName || (target ? playerNameOf(target) : null);
+      startWalking(name, target, true);
+      log('action follow', name);
     } else if (action === 'come') {
       comeTo(target, targetName);
     } else if (action === 'stop') {
+      stopWalking();
       currentTarget = null;
       bot.pathfinder.setGoal(null);
       bot.clearControlStates();
@@ -245,32 +256,131 @@ function jump () {
   setTimeout(() => bot.setControlState('jump', false), 300);
 }
 
-function comeTo (target, nameOverride) {
-  const name = nameOverride || playerNameOf(target);
-  if (!target && !name) return;
+const lastKnown = {};
+const lastKnownAt = {};
+let posRequestName = null;
+let posRequestAt = 0;
+let walkMisses = 0;
+let walkTimer = null;
+
+function requestPos (name) {
+  const now = Date.now();
+  if (!name || now - posRequestAt < 4000) return;
+  posRequestName = name;
+  posRequestAt = now;
+  cmd(`/data get entity ${name} Pos`);
+}
+let walkName = null;
+let walkKeep = false;
+let walkTarget = null;
+let lastWalkPos = null;
+let stuckTicks = 0;
+
+function stopWalking () {
+  if (walkTimer) clearInterval(walkTimer);
+  walkTimer = null;
+  walkName = null;
+  walkTarget = null;
+  walkKeep = false;
+  stuckTicks = 0;
+  lastWalkPos = null;
+}
+
+function startWalking (name, target, keepFollowing) {
+  stopWalking();
+  walkName = name || (target ? playerNameOf(target) : null);
+  walkTarget = target || null;
+  walkKeep = !!keepFollowing;
   currentTarget = target || null;
   goalSince = Date.now();
+  if (!walkName && !walkTarget) return;
+  if (walkTarget && walkName) { lastKnown[walkName] = walkTarget.position.clone(); lastKnownAt[walkName] = Date.now(); }
+  walkMisses = 0;
+  walkTick();
+  walkTimer = setInterval(walkTick, 2500);
+}
+
+function walkTick () {
+  if (!bot || !bot.entity) return;
+  try {
+    const name = walkName || (walkTarget ? playerNameOf(walkTarget) : null);
+    const live = name ? (bot.players[name] && bot.players[name].entity) : null;
+    if (live) {
+      walkTarget = live;
+      currentTarget = live;
+      lastKnown[name] = live.position.clone();
+      lastKnownAt[name] = Date.now();
+      walkMisses = 0;
+    }
+    let pos = live ? live.position : (name ? lastKnown[name] : (walkTarget ? walkTarget.position : null));
+    if (!pos) {
+      if (name) {
+        requestPos(name);
+        walkMisses++;
+        if (walkMisses > 2) {
+          say('你在哪呀？我找不到你，报个坐标或者靠近点吧。');
+          stopWalking();
+        }
+      } else {
+        stopWalking();
+      }
+      return;
+    }
+    const bp = bot.entity.position;
+    const d = bp.distanceTo(pos);
+    if (walkKeep) {
+      if (d <= 4 && live) bot.pathfinder.setGoal(new GoalFollow(live, 2), true);
+      else if (d > 48) {
+        const dir = pos.minus(bp).normalize();
+        const wp = bp.plus(dir.scaled(24));
+        bot.pathfinder.setGoal(new GoalNear(wp.x, wp.y, wp.z, 2), false);
+      } else {
+        bot.pathfinder.setGoal(new GoalNear(pos.x, pos.y, pos.z, 2), false);
+      }
+    } else {
+      if (d <= 2.5) {
+        bot.pathfinder.setGoal(null);
+        try { bot.lookAt(pos.offset(0, 1.6, 0), true); } catch {}
+        stopWalking();
+        return;
+      }
+      if (d > 48) {
+        const dir = pos.minus(bp).normalize();
+        const wp = bp.plus(dir.scaled(24));
+        bot.pathfinder.setGoal(new GoalNear(wp.x, wp.y, wp.z, 2), false);
+      } else {
+        bot.pathfinder.setGoal(new GoalNear(pos.x, pos.y, pos.z, 1), false);
+      }
+    }
+    if (lastWalkPos && bp.distanceTo(lastWalkPos) < 0.8) {
+      stuckTicks++;
+      jump();
+      if (stuckTicks >= 2) {
+        const ang = Math.random() * Math.PI * 2;
+        const wp = bp.offset(Math.cos(ang) * 5, 0, Math.sin(ang) * 5);
+        bot.pathfinder.setGoal(new GoalNear(wp.x, wp.y, wp.z, 2), false);
+        stuckTicks = 0;
+      }
+    } else {
+      stuckTicks = 0;
+    }
+    lastWalkPos = bp.clone();
+  } catch (e) {
+    log('walk error:', e.message);
+  }
+}
+
+function comeTo (target, nameOverride) {
+  const name = nameOverride || (target ? playerNameOf(target) : null);
+  if (!target && !name) return;
   if (CFG.allowTp && name) {
     cmd(`/tp ${bot.username} ${name}`);
     log('tp to', name);
     if (target) setTimeout(() => { try { bot.lookAt(target.position.offset(0, 1.6, 0), true); } catch {} }, 500);
     return;
   }
-  if (!target) return;
-  const p = target.position;
-  const ground = findGround(p.x, p.y, p.z);
-  bot.pathfinder.setGoal(new GoalNear(p.x, ground, p.z, 2), true);
-  log('action come');
-  const started = Date.now();
-  const timer = setInterval(() => {
-    if (!bot.entity || currentTarget !== target) { clearInterval(timer); return; }
-    const dist = bot.entity.position.distanceTo(target.position);
-    if (dist <= 3) { clearInterval(timer); return; }
-    if (Date.now() - started > 7000) {
-      clearInterval(timer);
-      if (dist > 6 && CFG.allowTp && name) { cmd(`/tp ${bot.username} ${name}`); log('tp fallback to', name); }
-    }
-  }, 1000);
+  startWalking(name, target, false);
+  log('action come', name);
 }
 
 function inferAction (say, action) {
@@ -451,8 +561,7 @@ async function buildHouse (villa) {
 
   building = false;
   say(villa ? '别墅封顶！虽然算不上宫殿，但绝对能住人。走，进去看看？' : '完工！虽然不大，但遮风挡雨够了。走，进去看看？');
-  currentTarget = player;
-  try { bot.pathfinder.setGoal(new GoalFollow(player, 2), true); } catch {}
+  startWalking(playerNameOf(player), player, true);
 }
 
 async function decorateHouse (username) {
@@ -530,6 +639,9 @@ function connect () {
     movements.allow1by1towers = false;
     movements.scafoldingBlocks = [];
     movements.scaffoldingBlocks = [];
+    movements.maxDropDown = 16;
+    movements.allowParkour = true;
+    movements.canOpenDoors = true;
     bot.pathfinder.setMovements(movements);
     joinedAt = Date.now();
     log('spawned at', bot.entity.position.toString());
@@ -566,6 +678,19 @@ function connect () {
     setTimeout(() => say(`${name}你没事吧？要不要我过去？`), 800);
   });
 
+  bot.on('message', (msg) => {
+    try {
+      const s = msg.toString();
+      if (!posRequestName || Date.now() - posRequestAt > 5000) return;
+      const m = s.match(/\[\s*(-?\d+(?:\.\d+)?)d?,\s*(-?\d+(?:\.\d+)?)d?,\s*(-?\d+(?:\.\d+)?)d?\s*\]/);
+      if (m && /entity data|实体数据|拥有以下/.test(s)) {
+        lastKnown[posRequestName] = new Vec3(parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]));
+        lastKnownAt[posRequestName] = Date.now();
+        log('pos update', posRequestName, m[1], m[2], m[3]);
+      }
+    } catch {}
+  });
+
   bot.on('kicked', (reason) => log('kicked:', JSON.stringify(reason).slice(0, 300)));
   bot.on('error', (e) => log('error:', e.message));
   bot.on('end', (reason) => {
@@ -574,17 +699,6 @@ function connect () {
   });
 
   startProactiveLoop();
-  setInterval(() => {
-    if (!currentTarget || !bot.entity) return;
-    const name = playerNameOf(currentTarget);
-    if (!name) return;
-    const d = bot.entity.position.distanceTo(currentTarget.position);
-    if (d > 24 && CFG.allowTp && Date.now() - goalSince > 8000) {
-      cmd(`/tp ${bot.username} ${name}`);
-      log('follow tp to', name);
-      goalSince = Date.now();
-    }
-  }, 5000);
 }
 
 async function handleChat (username, message) {
@@ -649,6 +763,10 @@ function startProactiveLoop () {
   setInterval(() => {
     if (!bot || !bot.entity) return;
     const now = Date.now();
+    for (const n of Object.keys(bot.players || {})) {
+      const e = bot.players[n] && bot.players[n].entity;
+      if (e && n !== bot.username) { lastKnown[n] = e.position.clone(); lastKnownAt[n] = Date.now(); }
+    }
     // 偶尔看看玩家，像真人一样
     const target = nearestPlayerEntity();
     if (target && now - lastActionAt > 8000 && Math.random() < 0.5) {
