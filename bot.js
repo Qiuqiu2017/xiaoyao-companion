@@ -5,7 +5,7 @@ const path = require('path');
 const zlib = require('zlib');
 const mineflayer = require('mineflayer');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
-const { GoalFollow, GoalNear } = goals;
+const { GoalFollow, GoalNear, GoalXZ } = goals;
 const Vec3 = require('vec3');
 
 const PROVIDERS = {
@@ -274,16 +274,203 @@ let walkName = null;
 let walkKeep = false;
 let walkTarget = null;
 let lastWalkPos = null;
+let lastGoalKey = '';
+let lastWalkLog = 0;
+let manualUntil = 0;
+let manualTimer = null;
+let walkMovements = null;
+let hardStuck = 0;
+let bestDist = Infinity;
+let noProgressSince = 0;
 let stuckTicks = 0;
 
 function stopWalking () {
   if (walkTimer) clearInterval(walkTimer);
+  if (manualTimer) clearInterval(manualTimer);
+  manualTimer = null;
+  manualUntil = 0;
+  if (bot) {
+    for (const k of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
+      try { bot.setControlState(k, false); } catch {}
+    }
+  }
   walkTimer = null;
   walkName = null;
   walkTarget = null;
   walkKeep = false;
   stuckTicks = 0;
   lastWalkPos = null;
+  lastGoalKey = '';
+}
+
+let diggingOut = false;
+let digTimer = null;
+
+function digOut () {
+  if (!walkMovements || diggingOut) return;
+  diggingOut = true;
+  clearManual();
+  log('digging out');
+  walkMovements.canDig = true;
+  lastGoalKey = '';
+  bestDist = Infinity;
+  noProgressSince = Date.now();
+  walkTick();
+  if (digTimer) clearTimeout(digTimer);
+  digTimer = setTimeout(() => {
+    diggingOut = false;
+    walkMovements.canDig = false;
+    lastGoalKey = '';
+    log('stop digging');
+  }, 12000);
+}
+
+function clearManual () {
+  manualUntil = 0;
+  if (bot) {
+    for (const k of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
+      try { bot.setControlState(k, false); } catch {}
+    }
+  }
+  lastGoalKey = '';
+}
+
+let lastDoorTry = 0;
+let manualDigging = false;
+let lastManualDigTry = 0;
+function tryOpenDoor () {
+  if (!bot || !bot.entity) return false;
+  if (Date.now() - lastDoorTry < 3000) return false;
+  lastDoorTry = Date.now();
+  const bp = bot.entity.position;
+  const doors = [];
+  for (let dx = -4; dx <= 4; dx++) {
+    for (let dy = -1; dy <= 2; dy++) {
+      for (let dz = -4; dz <= 4; dz++) {
+        const b = bot.blockAt(bp.offset(dx, dy, dz));
+        if (b && b.name && b.name.includes('door')) doors.push(b);
+      }
+    }
+  }
+  let opened = 0;
+  for (const d of doors.slice(0, 4)) {
+    try {
+      const props = d.getProperties ? d.getProperties() : {};
+      if (props.open === true || props.open === 'true') continue;
+      bot.activateBlock(d);
+      opened++;
+    } catch {}
+  }
+  if (opened) { log('opened door(s):', opened); lastGoalKey = ''; return true; }
+  return false;
+}
+
+function startManual (ms) {
+  if (!bot || !bot.entity) return;
+  if (tryOpenDoor()) { lastGoalKey = ''; return; }
+  manualUntil = Date.now() + ms;
+  try { bot.pathfinder.setGoal(null); } catch {}
+  lastGoalKey = '';
+  if (!manualTimer) manualTimer = setInterval(manualWalkTick, 300);
+  log('manual walk for', ms, 'ms');
+}
+
+function targetPos () {
+  const name = walkName || (walkTarget ? playerNameOf(walkTarget) : null);
+  const live = name ? (bot.players[name] && bot.players[name].entity) : null;
+  const pos = live ? live.position : (name ? lastKnown[name] : (walkTarget ? walkTarget.position : null));
+  return { name, live, pos };
+}
+
+async function manualDigAhead () {
+  if (manualDigging) return;
+  try {
+    const { pos } = targetPos();
+    if (!pos) return;
+    const bp = bot.entity.position;
+    const dx = pos.x - bp.x, dz = pos.z - bp.z;
+    const yaw = Math.atan2(-dx, dz);
+    const fx = -Math.sin(yaw), fz = Math.cos(yaw);
+    for (const dy of [0, 1]) {
+      const b = bot.blockAt(bp.offset(fx * 1.2, dy, fz * 1.2));
+      if (b && b.boundingBox === 'block' && b.diggable) {
+        manualDigging = true;
+        log('manual dig', b.name);
+        try { await bot.dig(b, true); } catch (e) { log('dig failed', e.message); }
+        manualDigging = false;
+        return;
+      }
+    }
+  } catch (e) {
+    manualDigging = false;
+  }
+}
+
+function manualWalkTick () {
+  if (!bot || !bot.entity) return;
+  if (Date.now() > manualUntil) {
+    clearManual();
+    walkTick();
+    return;
+  }
+  try {
+    const { pos } = targetPos();
+    if (!pos) { clearManual(); return; }
+    const bp = bot.entity.position;
+    if (Math.hypot(bp.x - pos.x, bp.z - pos.z) <= 2.5) { clearManual(); stopWalking(); return; }
+    const dx = pos.x - bp.x, dz = pos.z - bp.z;
+    const yaw = Math.atan2(-dx, dz);
+    bot.look(yaw, 0, true);
+    const fx = -Math.sin(yaw), fz = Math.cos(yaw);
+    const solid = (b) => b && b.boundingBox === 'block';
+    const at = (ox, oy, oz) => bot.blockAt(bp.offset(ox, oy, oz));
+    const feet = at(fx * 1.1, 0.1, fz * 1.1);
+    const head = at(fx * 1.1, 1.4, fz * 1.1);
+    const floorAhead = at(fx * 1.1, -0.9, fz * 1.1);
+    const floorFar = at(fx * 1.8, -2.2, fz * 1.8);
+    if ((solid(feet) || solid(head)) && Date.now() - lastManualDigTry > 1500) {
+      lastManualDigTry = Date.now();
+      manualDigAhead();
+    }
+    if (solid(feet) && !solid(head)) {
+      bot.setControlState('jump', true);
+      setTimeout(() => { try { bot.setControlState('jump', false); } catch {} }, 260);
+    } else if (solid(feet) || solid(head)) {
+      const ly = yaw - Math.PI / 4, ry = yaw + Math.PI / 4;
+      const ok = (yy) => !solid(at(-Math.sin(yy) * 1.3, 0.6, Math.cos(yy) * 1.3));
+      const dir = ok(ly) ? 'left' : (ok(ry) ? 'right' : null);
+      if (dir) {
+        bot.setControlState(dir, true);
+        setTimeout(() => { try { bot.setControlState(dir, false); } catch {} }, 500);
+      } else {
+        bot.setControlState('jump', true);
+        setTimeout(() => { try { bot.setControlState('jump', false); } catch {} }, 260);
+      }
+    }
+    const targetBelow = pos.y < bp.y - 1.2;
+    if (!solid(floorAhead) && !solid(floorFar) && !targetBelow) {
+      // 前方是大落差且目标不在下方，先别直冲
+      bot.setControlState('forward', false);
+      const side = Math.random() < 0.5 ? 'left' : 'right';
+      bot.setControlState(side, true);
+      setTimeout(() => { try { bot.setControlState(side, false); } catch {} }, 450);
+    } else {
+      bot.setControlState('forward', true);
+      bot.setControlState('sprint', true);
+      if (targetBelow && !solid(floorAhead)) {
+        bot.setControlState('jump', true);
+        setTimeout(() => { try { bot.setControlState('jump', false); } catch {} }, 280);
+      }
+    }
+  } catch (e) {
+    log('manual error:', e.message);
+  }
+}
+
+function setWalkGoal (goal, key, dynamic) {
+  if (key === lastGoalKey && bot.pathfinder.isMoving()) return;
+  lastGoalKey = key;
+  bot.pathfinder.setGoal(goal, dynamic);
 }
 
 function startWalking (name, target, keepFollowing) {
@@ -294,14 +481,18 @@ function startWalking (name, target, keepFollowing) {
   currentTarget = target || null;
   goalSince = Date.now();
   if (!walkName && !walkTarget) return;
+  log('startWalking', walkName, walkTarget ? walkTarget.position.toString() : 'no-entity');
   if (walkTarget && walkName) { lastKnown[walkName] = walkTarget.position.clone(); lastKnownAt[walkName] = Date.now(); }
   walkMisses = 0;
+  bestDist = Infinity;
+  noProgressSince = Date.now();
   walkTick();
   walkTimer = setInterval(walkTick, 2500);
 }
 
 function walkTick () {
   if (!bot || !bot.entity) return;
+  if (Date.now() < manualUntil) return;
   try {
     const name = walkName || (walkTarget ? playerNameOf(walkTarget) : null);
     const live = name ? (bot.players[name] && bot.players[name].entity) : null;
@@ -312,7 +503,9 @@ function walkTick () {
       lastKnownAt[name] = Date.now();
       walkMisses = 0;
     }
-    let pos = live ? live.position : (name ? lastKnown[name] : (walkTarget ? walkTarget.position : null));
+    const bp = bot.entity.position;
+    let pos = live ? live.position : (name ? lastKnown[name] : null);
+
     if (!pos) {
       if (name) {
         requestPos(name);
@@ -326,48 +519,86 @@ function walkTick () {
       }
       return;
     }
-    const bp = bot.entity.position;
+
     const d = bp.distanceTo(pos);
-    if (walkKeep) {
-      if (d <= 4 && live) bot.pathfinder.setGoal(new GoalFollow(live, 2), true);
-      else if (d > 48) {
-        const dir = pos.minus(bp).normalize();
-        const wp = bp.plus(dir.scaled(24));
-        bot.pathfinder.setGoal(new GoalNear(wp.x, wp.y, wp.z, 2), false);
-      } else {
-        bot.pathfinder.setGoal(new GoalNear(pos.x, pos.y, pos.z, 2), false);
+    if (d < bestDist - 1.5) { bestDist = d; noProgressSince = Date.now(); }
+    if (Date.now() - noProgressSince > 10000 && !diggingOut) { digOut(); hardStuck = 0; }
+    if (live && walkKeep) {
+      const key = `followxz:${Math.round(pos.x)}:${Math.round(pos.z)}`;
+      setWalkGoal(new GoalXZ(pos.x, pos.z), key, false);
+      if (Date.now() - lastWalkLog > 5000) {
+        lastWalkLog = Date.now();
+        log('walk follow', name, 'd=', d.toFixed(1), 'moving=', bot.pathfinder.isMoving());
       }
-    } else {
-      if (d <= 2.5) {
-        bot.pathfinder.setGoal(null);
-        try { bot.lookAt(pos.offset(0, 1.6, 0), true); } catch {}
-        stopWalking();
-        return;
-      }
-      if (d > 48) {
-        const dir = pos.minus(bp).normalize();
-        const wp = bp.plus(dir.scaled(24));
-        bot.pathfinder.setGoal(new GoalNear(wp.x, wp.y, wp.z, 2), false);
-      } else {
-        bot.pathfinder.setGoal(new GoalNear(pos.x, pos.y, pos.z, 1), false);
-      }
+      return;
     }
-    if (lastWalkPos && bp.distanceTo(lastWalkPos) < 0.8) {
+
+    const hd = Math.hypot(bp.x - pos.x, bp.z - pos.z);
+    if (!walkKeep && hd <= 2.5) {
+      bot.pathfinder.setGoal(null);
+      try { bot.lookAt(pos.offset(0, 1.6, 0), true); } catch {}
+      stopWalking();
+      return;
+    }
+
+    if (live) {
+      const key = `nearxz:${Math.round(pos.x)}:${Math.round(pos.z)}`;
+      setWalkGoal(new GoalXZ(pos.x, pos.z), key, false);
+      logWalkState(name, d);
+    } else {
+      const dir = pos.minus(bp).normalize();
+      const wp = d > 48 ? bp.plus(dir.scaled(24)) : pos;
+      const key = `xz:${Math.round(wp.x)}:${Math.round(wp.z)}`;
+      setWalkGoal(new GoalXZ(wp.x, wp.z), key, false);
+      logWalkState(name, d);
+    }
+
+    // 卡住检测
+    const horiz = lastWalkPos ? Math.hypot(bp.x - lastWalkPos.x, bp.z - lastWalkPos.z) : 9;
+    if (horiz < 0.45) {
       stuckTicks++;
+      hardStuck++;
+      if (hardStuck >= 3 && !diggingOut) { digOut(); hardStuck = 0; }
       jump();
       if (stuckTicks >= 2) {
         const ang = Math.random() * Math.PI * 2;
-        const wp = bp.offset(Math.cos(ang) * 5, 0, Math.sin(ang) * 5);
-        bot.pathfinder.setGoal(new GoalNear(wp.x, wp.y, wp.z, 2), false);
+        const wp = bp.offset(Math.cos(ang) * 6, 0, Math.sin(ang) * 6);
+        lastGoalKey = '';
+        bot.pathfinder.setGoal(new GoalXZ(wp.x, wp.z), false);
+        log('stuck, detour to', wp.x.toFixed(0), wp.z.toFixed(0));
         stuckTicks = 0;
       }
     } else {
       stuckTicks = 0;
+      hardStuck = 0;
     }
     lastWalkPos = bp.clone();
   } catch (e) {
     log('walk error:', e.message);
   }
+}
+
+function dumpAround () {
+  if (!bot || !bot.entity) return;
+  const p = bot.entity.position.floored();
+  log('=== around bot at', p.x, p.y, p.z, '===');
+  for (let dy = -1; dy <= 2; dy++) {
+    for (let dz = -2; dz <= 2; dz++) {
+      let row = '';
+      for (let dx = -2; dx <= 2; dx++) {
+        const b = bot.blockAt(new Vec3(p.x + dx, p.y + dy, p.z + dz));
+        row += (b ? b.name.replace('minecraft:', '').slice(0, 6) : '?').padEnd(8);
+      }
+      log('y' + (p.y + dy) + ' z' + (p.z + dz) + ': ' + row);
+    }
+  }
+}
+
+function logWalkState (name, d) {
+  if (Date.now() - lastWalkLog < 5000) return;
+  lastWalkLog = Date.now();
+  const p = bot.entity.position;
+  log('walking', name || '?', 'pos=', p.x.toFixed(1), p.y.toFixed(1), p.z.toFixed(1), 'd=', d.toFixed(1), 'moving=', bot.pathfinder.isMoving());
 }
 
 function comeTo (target, nameOverride) {
@@ -569,7 +800,9 @@ async function decorateHouse (username) {
   const { x0, x1, z0, z1, y0, doorX, doorZ } = lastHouse;
   const y = y0 + 1;
   say('行，我给它加一圈栅栏和灯，再铺条小路。');
-  cmd(`/fill ${x0 - 1} ${y} ${z0 - 1} ${x1 + 1} ${y} ${z0 - 1} minecraft:oak_fence`);
+  cmd(`/fill ${x0 - 1} ${y} ${z0 - 1} ${doorX - 1} ${y} ${z0 - 1} minecraft:oak_fence`);
+  await sleep(120);
+  cmd(`/fill ${doorX + 1} ${y} ${z0 - 1} ${x1 + 1} ${y} ${z0 - 1} minecraft:oak_fence`);
   await sleep(180);
   cmd(`/fill ${x0 - 1} ${y} ${z1 + 1} ${x1 + 1} ${y} ${z1 + 1} minecraft:oak_fence`);
   await sleep(180);
@@ -636,6 +869,8 @@ function connect () {
   bot.once('spawn', () => {
     const movements = new Movements(bot);
     movements.canDig = false;
+    movements.protectDigBlocks = ['oak_planks', 'spruce_planks', 'stone_bricks', 'glass', 'white_terracotta', 'lantern'];
+    walkMovements = movements;
     movements.allow1by1towers = false;
     movements.scafoldingBlocks = [];
     movements.scaffoldingBlocks = [];
@@ -645,6 +880,7 @@ function connect () {
     bot.pathfinder.setMovements(movements);
     joinedAt = Date.now();
     log('spawned at', bot.entity.position.toString());
+    setTimeout(dumpAround, 1500);
     setTimeout(() => {
       const p = nearestPlayerEntity();
       const name = playerNameOf(p);
@@ -691,6 +927,16 @@ function connect () {
     } catch {}
   });
 
+  bot.on('path_update', (r) => {
+    if (r.status === 'noPath' || r.status === 'timeout') {
+      log('path', r.status);
+      lastGoalKey = '';
+      if (walkTimer) {
+        if (!tryOpenDoor()) startManual(5000);
+      }
+    }
+  });
+
   bot.on('kicked', (reason) => log('kicked:', JSON.stringify(reason).slice(0, 300)));
   bot.on('error', (e) => log('error:', e.message));
   bot.on('end', (reason) => {
@@ -706,6 +952,11 @@ async function handleChat (username, message) {
   if (!text || text.startsWith('/')) return;
 
   // 直接指令优先，避免 LLM 抽风
+  const nm = text.match(/(?:去|到|找)\s*([A-Za-z0-9_]{3,16})\s*(?:那里|那儿|这边|这里)?/);
+  if (nm && nm[1] !== bot.username && bot.players[nm[1]]) {
+    doAction('come', nm[1]);
+    return;
+  }
   if (/别墅|大房子|两层|二层/.test(text) && /建|盖|造/.test(text)) {
     doAction('build_villa', username);
     return;
